@@ -114,6 +114,35 @@ app's OAuth callback handler against the mock):
 - This is **deferred**; flag as a stretch goal, not required for the primary use case
   (multi-account write/read simulation via pre-seeded tokens).
 
+### Password mode (`[auth] require_password = true`)
+
+For running the mock on a publicly reachable host (e.g. as a live test instance for
+a third-party admin tool). Off by default; every other section describes the
+default mode. When on:
+
+- `GET /oauth/authorize` checks `client_id` and that `redirect_uri` is one the app
+  registered, then renders a username-or-email + password form. It never lists accounts.
+- `POST /oauth/authorize` verifies the password (scrypt hash in `accounts.password_hash`)
+  and mints a random code, held in memory for 10 minutes and redeemable once. Requested
+  scopes must be a subset of the app's registered scopes.
+- `/oauth/token` with `authorization_code` accepts only those codes, and only with the
+  matching `client_id`, `client_secret` (body or HTTP Basic) and `redirect_uri`.
+  `mockcode_*` codes are refused.
+- `/api/v1/_mock/*` returns 404 and `/_ui/` isn't mounted.
+- `/api/v1/admin/*` and `/api/v2/admin/*` return 403 unless the token's account has the
+  `moderator`, `admin` or `owner` role.
+- Seed `access_token`s are not created (they're well-known strings like `mock_token`).
+- `POST /api/v1/accounts` returns 403 when `registrations_enabled = false`.
+- `[auth] permissive = true` is refused at startup.
+
+Passwords are set with the CLI against a file-backed database:
+
+```bash
+mastodon_mock set-password admin --create --role admin --database ./mock.sqlite
+```
+
+Pending authorization codes live in process memory, so run a single worker.
+
 ## Bearer token resolution (every authenticated request)
 
 `mastodon_mock/deps.py`:
@@ -184,6 +213,10 @@ enough to exercise Mastodon.py's `ratelimit_method` (`throw`/`wait`/`pace`).
 - On success: creates an `accounts` row, an `oauth_tokens` row (bound to the
   client-credentials token's `app_id`, `account_id` = new account), and returns
   `{"access_token": ..., "token_type": "Bearer", "scope": "...", "created_at": ...}`.
+- Stores the email, client IP, `reason` (as the admin API's `invite_request`) and a hash
+  of the password. With `registration_approval_required = true` the account starts
+  pending (`approved=false`), so it shows under `pending=true` in the admin API and can't
+  sign in until approved.
 - No email confirmation step is modeled — the returned token is immediately usable
   (real Mastodon would require email confirmation before the token works for most
   scopes; mock skips this for simplicity, since `email_resend_confirmation` is a stub

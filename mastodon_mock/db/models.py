@@ -65,6 +65,8 @@ class Account(Base):
     suspended: Mapped[bool] = mapped_column(Boolean, default=False)
     sensitized: Mapped[bool] = mapped_column(Boolean, default=False)
     invite_request: Mapped[str | None] = mapped_column(String, nullable=True)
+    # scrypt hash (see mastodon_mock.passwords); only checked when [auth] require_password is on.
+    password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
 
     __table_args__ = (UniqueConstraint("username", "domain", name="uq_account_username_domain"),)
 

@@ -77,6 +77,35 @@ def add_middleware(app: FastAPI, config: MastodonMockConfig) -> None:
         _add_scope_enforcement(app)
     if config.ratelimit.enabled:
         _add_rate_limiting(app, config)
+    if config.auth.require_password:
+        _add_password_mode_guards(app)
+
+
+_MOCK_ONLY_PREFIX = "/api/v1/_mock"
+_ADMIN_PREFIXES = ("/api/v1/admin/", "/api/v2/admin/")
+_STAFF_ROLES = {"moderator", "admin", "owner"}
+
+
+def _add_password_mode_guards(app: FastAPI) -> None:
+    """Hide the unauthenticated mock-only routes and require a staff role for the admin API."""
+    from mastodon_mock.db.models import Account
+
+    @app.middleware("http")
+    async def _guard(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path
+        if path == _MOCK_ONLY_PREFIX or path.startswith(f"{_MOCK_ONLY_PREFIX}/"):
+            return JSONResponse(status_code=404, content={"error": "Record not found"})
+        token_str = _bearer_token(request)
+        # No token falls through so the route returns its usual 401.
+        if token_str is not None and path.startswith(_ADMIN_PREFIXES):
+            factory = request.app.state.session_factory
+            with factory() as session:
+                token = session.scalar(select(OAuthToken).where(OAuthToken.access_token == token_str))
+                account = session.get(Account, token.account_id) if token and token.account_id else None
+                role = account.role if account is not None else None
+            if role not in _STAFF_ROLES:
+                return JSONResponse(status_code=403, content={"error": "This action is not allowed"})
+        return await call_next(request)
 
 
 def _add_scope_enforcement(app: FastAPI) -> None:

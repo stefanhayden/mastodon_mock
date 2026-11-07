@@ -81,6 +81,17 @@ def main(argv: list[str] | None = None) -> None:
     upgrade.add_argument("db_command", choices=["upgrade"], help="Database subcommand")
     upgrade.add_argument("--config", default=None)
 
+    pw = sub.add_parser("set-password", help="Set a local account's password (for [auth] require_password)")
+    pw.add_argument("username", help="Local account username")
+    pw.add_argument("--config", default=None, help="Path to a .mastodon_mock.toml config file")
+    pw.add_argument("--database", default=None, help="SQLite path to write into (overrides config)")
+    pw.add_argument("--create", action="store_true", help="Create the account if it doesn't exist")
+    pw.add_argument(
+        "--role", choices=["user", "moderator", "admin", "owner"], default=None, help="Also set the account's role"
+    )
+    pw.add_argument("--email", default=None, help="Also set the account's email")
+    pw.add_argument("--password-stdin", action="store_true", help="Read the password from stdin instead of prompting")
+
     gen = sub.add_parser("gen-data", help="Bulk-generate throwaway sample data")
     gen.add_argument("--config", default=None, help="Path to a .mastodon_mock.toml config file")
     gen.add_argument("--preset", choices=sorted(PRESETS), default=None, help="Named size preset")
@@ -128,6 +139,8 @@ def main(argv: list[str] | None = None) -> None:
         _serve(args)
     elif args.command == "db":
         _db(args)
+    elif args.command == "set-password":
+        _set_password(args)
     elif args.command == "gen-data":
         _gen_data(args)
     elif args.command == "compare-openapi":
@@ -189,6 +202,60 @@ def _serve(args: argparse.Namespace) -> None:
         ssl_keyfile_password=getattr(args, "ssl_keyfile_password", None),
         log_level=getattr(args, "log_level", None),
     )
+
+
+_MIN_PASSWORD_LENGTH = 12
+
+
+def _set_password(args: argparse.Namespace) -> None:
+    """Set (and optionally create) a local account's password in a file-backed database."""
+    import getpass
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from mastodon_mock.db.base import Base, init_engine
+    from mastodon_mock.db.models import Account, utcnow
+    from mastodon_mock.passwords import hash_password
+
+    config = MastodonMockConfig.load(args.config)
+    if args.database is not None:
+        config.database.path = args.database
+    if config.database.path == ":memory:":
+        sys.exit("set-password needs a file-backed database: pass --database or set [database].path.")
+
+    if args.password_stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+    else:
+        password = getpass.getpass("New password: ")
+        if getpass.getpass("Repeat password: ") != password:
+            sys.exit("Passwords don't match.")
+    if len(password) < _MIN_PASSWORD_LENGTH:
+        sys.exit(f"Password must be at least {_MIN_PASSWORD_LENGTH} characters.")
+
+    engine = init_engine(config.database)
+    Base.metadata.create_all(engine, checkfirst=True)
+    with Session(engine) as session:
+        account = session.scalar(select(Account).where(Account.username == args.username, Account.domain.is_(None)))
+        if account is None:
+            if not args.create:
+                sys.exit(f"No local account {args.username!r}. Pass --create to make one.")
+            account = Account(
+                username=args.username,
+                display_name=args.username,
+                created_at=utcnow(),
+                fields=[],
+                email=f"{args.username}@local",
+            )
+            session.add(account)
+        account.password_hash = hash_password(password)
+        if args.role is not None:
+            account.role = args.role
+        if args.email is not None:
+            account.email = args.email
+        session.commit()
+        print(f"Password set for @{account.username} (role: {account.role}).")
+    engine.dispose()
 
 
 def _gen_data(args: argparse.Namespace) -> None:

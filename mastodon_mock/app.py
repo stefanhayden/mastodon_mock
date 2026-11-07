@@ -104,10 +104,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app(config: MastodonMockConfig | None = None) -> FastAPI:
     """Create and configure the FastAPI app for the given config."""
     config = config or MastodonMockConfig.load()
+    if config.auth.require_password and config.auth.permissive:
+        raise ValueError("[auth] permissive cannot be combined with require_password")
 
     engine = init_engine(config.database)
     Base.metadata.create_all(engine, checkfirst=True)
-    apply_seed_data(engine, config.seed)
+    apply_seed_data(engine, config.seed, with_tokens=not config.auth.require_password)
 
     media_path = config.media_storage_path or tempfile.mkdtemp(prefix="mastodon_mock_media_")
     Path(media_path).mkdir(parents=True, exist_ok=True)
@@ -137,6 +139,8 @@ def create_app(config: MastodonMockConfig | None = None) -> FastAPI:
     app.state.session_factory = make_session_factory(engine)
     app.state.media_path = media_path
     app.state.resource_finalizer = weakref.finalize(app, engine.dispose)
+    # Password mode's pending authorization codes: code -> PendingCode (see routers/oauth.py).
+    app.state.authorize_codes = {}
 
     if config.streaming.enabled:
         app.state.event_bus = EventBus(queue_maxsize=config.streaming.queue_maxsize)
@@ -225,7 +229,8 @@ def create_app(config: MastodonMockConfig | None = None) -> FastAPI:
         """Serve a deterministic per-account SVG header banner (see serializers/common.py)."""
         return Response(content=header_svg(seed), media_type="image/svg+xml")
 
-    ui_available = mount_ui(app)
+    # The admin UI logs in through the /api/v1/_mock routes, which password mode removes.
+    ui_available = False if config.auth.require_password else mount_ui(app)
 
     @app.get("/health")
     def health() -> Response:

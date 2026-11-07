@@ -108,6 +108,36 @@ See [HTTPS and Real Mastodon Clients](https://github.com/matthewdeanmartin/masto
 walkthrough (mkcert setup, troubleshooting, and how `serve` derives a reachable
 domain for avatar/header/status URLs).
 
+### Running on a public host (password mode)
+
+By default anyone who can reach the server can sign in as any account. To expose it on
+the internet, turn on password mode and give accounts passwords:
+
+```toml
+# .mastodon_mock.toml
+domain = "mock.example.com"
+url_scheme = "https"
+registration_approval_required = true
+
+[database]
+path = "./mock.sqlite"
+
+[auth]
+require_password = true
+
+[seed]
+accounts = []
+```
+
+```bash
+mastodon_mock set-password admin --create --role admin --email you@example.com --config .mastodon_mock.toml
+mastodon_mock serve --config .mastodon_mock.toml
+```
+
+Sign-in then needs a password, the `/api/v1/_mock/*` helpers and `/_ui/` are switched off,
+and the admin API requires a staff role. See "Password mode" in `spec/04-auth.md`.
+Run it behind a TLS-terminating proxy, as a single worker.
+
 ## Why I think this works
 
 - 100s of unit tests

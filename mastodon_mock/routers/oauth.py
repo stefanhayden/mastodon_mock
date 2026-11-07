@@ -5,18 +5,31 @@ Security is faked: tokens are random strings mapped 1:1 to accounts. The
 current Mastodon). ``authorization_code`` is supported via a bare-bones account
 picker at ``/oauth/authorize`` (see "Optional: permissive code flow" in spec/04-auth.md)
 for GUI clients (Whalebird, Fedistar) that do the full browser-redirect login.
+
+With ``[auth] require_password`` the code flow is real instead: a password login
+form, single-use random codes bound to the client and redirect URI, and client
+secret checks on exchange (see spec/04-auth.md "Password mode").
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import secrets
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from html import escape
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import or_
 
 from mastodon_mock.db.models import Account, OAuthApp, OAuthToken, utcnow
 from mastodon_mock.deps import Config, CurrentToken, DbSession, RequiredAccount
+from mastodon_mock.passwords import hash_password, verify_password
 from mastodon_mock.routers.helpers import read_body
 from mastodon_mock.serializers.accounts import serialize_account
 from mastodon_mock.serializers.common import account_acct, sid
@@ -52,6 +65,21 @@ def _decode_authorize_code(code: str) -> str | None:
     if not code.startswith(_AUTHORIZE_CODE_PREFIX):
         return None
     return code[len(_AUTHORIZE_CODE_PREFIX) :] or None
+
+
+_OOB_REDIRECT = "urn:ietf:wg:oauth:2.0:oob"
+_CODE_TTL = timedelta(minutes=10)
+
+
+@dataclass(frozen=True)
+class PendingCode:
+    """A password-mode authorization code awaiting exchange."""
+
+    account_id: int
+    client_id: str
+    redirect_uri: str
+    scopes: list[str]
+    expires_at: datetime
 
 
 @router.post("/api/v1/apps")
@@ -94,10 +122,13 @@ async def create_app(request: Request, db: DbSession) -> dict[str, Any]:
 
 
 @router.post("/oauth/token")
-async def oauth_token(request: Request, db: DbSession) -> dict[str, Any]:
+async def oauth_token(request: Request, db: DbSession, config: Config) -> dict[str, Any]:
     """Issue tokens. Only ``client_credentials``, ``authorization_code``, and ``refresh_token`` succeed."""
     form = await read_body(request)
     grant_type = form.get("grant_type")
+
+    if grant_type == "authorization_code" and config.auth.require_password:
+        return _exchange_pending_code(request, db, form)
 
     if grant_type == "client_credentials":
         app = _resolve_app(db, form.get("client_id"))
@@ -113,7 +144,11 @@ async def oauth_token(request: Request, db: DbSession) -> dict[str, Any]:
         return _token_response(token)
 
     if grant_type == "refresh_token":
-        existing = db.query(OAuthToken).filter(OAuthToken.refresh_token == form.get("refresh_token")).first()
+        refresh_token = form.get("refresh_token")
+        # Guard the empty case: `== None` compiles to IS NULL and would match any token.
+        existing = (
+            db.query(OAuthToken).filter(OAuthToken.refresh_token == refresh_token).first() if refresh_token else None
+        )
         if existing is None:
             raise HTTPException(status_code=400, detail="invalid_grant")
         existing.access_token = _token()
@@ -148,6 +183,7 @@ async def oauth_token(request: Request, db: DbSession) -> dict[str, Any]:
 def oauth_authorize_picker(
     request: Request,
     db: DbSession,
+    config: Config,
     client_id: str,
     redirect_uri: str,
     response_type: str,
@@ -160,13 +196,20 @@ def oauth_authorize_picker(
     ``response_type=code``. There's no session/login concept in the mock, so instead
     of guessing an account, this renders a tiny HTML page listing local accounts;
     picking one POSTs back here and issues the redirect with a code.
+
+    In password mode it renders a username/password form instead, and never lists accounts.
     """
     del response_type
+    if config.auth.require_password:
+        app = _require_registered_client(db, client_id, redirect_uri)
+        _requested_scopes(app, scope)
+        return _login_form(client_id, redirect_uri, scope, state)
+
     accounts = db.query(Account).filter(Account.domain.is_(None)).order_by(Account.id).all()
 
     options = "\n".join(
-        f'<li><button type="submit" name="username" value="{a.username}">'
-        f"{a.display_name or a.username} (@{a.username})</button></li>"
+        f'<li><button type="submit" name="username" value="{escape(a.username)}">'
+        f"{escape(a.display_name or a.username)} (@{escape(a.username)})</button></li>"
         for a in accounts
     )
     html = f"""<!doctype html>
@@ -175,10 +218,7 @@ def oauth_authorize_picker(
 <h1>mastodon_mock</h1>
 <p>Authorize this app as:</p>
 <form method="post" action="/oauth/authorize">
-  <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-  <input type="hidden" name="client_id" value="{client_id}">
-  <input type="hidden" name="scope" value="{scope}">
-  <input type="hidden" name="state" value="{state}">
+  {_hidden_fields(client_id, redirect_uri, scope, state)}
   <ul>{options}</ul>
 </form>
 </body></html>"""
@@ -186,25 +226,159 @@ def oauth_authorize_picker(
 
 
 @router.post("/oauth/authorize")
-async def oauth_authorize_submit(request: Request) -> Response:
+async def oauth_authorize_submit(request: Request, db: DbSession, config: Config) -> Response:
     """Issue a code for the chosen account and redirect (or display it for ``oob``)."""
     form = await request.form()
+    if config.auth.require_password:
+        return _password_authorize(request, db, {k: str(v) for k, v in form.items()})
+
     username = str(form.get("username", ""))
-    redirect_uri = str(form.get("redirect_uri") or "urn:ietf:wg:oauth:2.0:oob")
-    state = form.get("state")
-    code = _encode_authorize_code(username)
+    redirect_uri = str(form.get("redirect_uri") or _OOB_REDIRECT)
+    return _code_redirect(redirect_uri, _encode_authorize_code(username), str(form.get("state") or ""))
 
-    if redirect_uri == "urn:ietf:wg:oauth:2.0:oob":
-        return Response(
-            content=f"<!doctype html><html><body><p>Authorization code: {code}</p></body></html>",
-            media_type="text/html",
-        )
 
+def _password_authorize(request: Request, db: DbSession, form: dict[str, str]) -> Response:
+    """Password mode: check credentials, then mint a single-use code bound to client + redirect."""
+    from mastodon_mock.moderation import account_is_active
+
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    scope = form.get("scope", "read")
+    state = form.get("state", "")
+    app = _require_registered_client(db, client_id, redirect_uri)
+    scopes = _requested_scopes(app, scope)
+
+    login = form.get("username", "").strip()
+    password = form.get("password", "")
+    account = (
+        db.query(Account)
+        .filter(Account.domain.is_(None), or_(Account.username == login, Account.email == login))
+        .first()
+        if login
+        else None
+    )
+    if account is None:
+        hash_password(password)  # same work as a real check, so timing doesn't reveal usernames
+    if account is None or not verify_password(password, account.password_hash):
+        return _login_form(client_id, redirect_uri, scope, state, error="Invalid username or password.", status=401)
+    if not account_is_active(account):
+        return _login_form(client_id, redirect_uri, scope, state, error="Your login is currently disabled.", status=403)
+
+    codes: dict[str, PendingCode] = request.app.state.authorize_codes
+    now = utcnow()
+    for stale in [c for c, p in codes.items() if p.expires_at <= now]:
+        del codes[stale]
+    code = secrets.token_urlsafe(32)
+    codes[code] = PendingCode(
+        account_id=account.id,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        scopes=scopes,
+        expires_at=now + _CODE_TTL,
+    )
+    return _code_redirect(redirect_uri, code, state)
+
+
+def _exchange_pending_code(request: Request, db: DbSession, form: dict[str, Any]) -> dict[str, Any]:
+    """Password mode: redeem a code once, for the client and redirect URI it was issued to."""
+    from mastodon_mock.moderation import account_is_active
+
+    codes: dict[str, PendingCode] = request.app.state.authorize_codes
+    pending = codes.pop(str(form.get("code", "")), None)
+    if pending is None or pending.expires_at <= utcnow():
+        raise HTTPException(status_code=400, detail="invalid_grant")
+    app = _authenticate_client(request, db, form)
+    if app is None:
+        raise HTTPException(status_code=401, detail="invalid_client")
+    if app.client_id != pending.client_id or str(form.get("redirect_uri", "")) != pending.redirect_uri:
+        raise HTTPException(status_code=400, detail="invalid_grant")
+    account = db.get(Account, pending.account_id)
+    if account is None:
+        raise HTTPException(status_code=400, detail="invalid_grant")
+    if not account_is_active(account):
+        raise HTTPException(status_code=403, detail="Your login is currently disabled")
+    token = OAuthToken(
+        access_token=_token(),
+        app_id=app.id,
+        account_id=account.id,
+        scopes=pending.scopes,
+        created_at=utcnow(),
+    )
+    db.add(token)
+    db.commit()
+    return _token_response(token)
+
+
+def _require_registered_client(db: DbSession, client_id: str, redirect_uri: str) -> OAuthApp:
+    """The app for ``client_id``, provided ``redirect_uri`` is one it registered."""
+    app = _resolve_app(db, client_id)
+    if app is None:
+        raise HTTPException(status_code=401, detail="Client authentication failed due to unknown client")
+    if redirect_uri not in app.redirect_uris:
+        raise HTTPException(status_code=400, detail="The redirect uri included is not valid.")
+    return app
+
+
+def _requested_scopes(app: OAuthApp, scope: str) -> list[str]:
+    """The requested scopes, which must all have been registered by the app."""
+    scopes = scope.split() or list(app.scopes)
+    if not set(scopes) <= set(app.scopes):
+        raise HTTPException(status_code=400, detail="The requested scope is invalid, unknown, or malformed.")
+    return scopes
+
+
+def _authenticate_client(request: Request, db: DbSession, form: dict[str, Any]) -> OAuthApp | None:
+    """Check the client secret, sent in the body or as HTTP Basic auth."""
+    client_id = form.get("client_id")
+    client_secret = form.get("client_secret")
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(auth[6:], validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return None
+        raw_id, _, raw_secret = decoded.partition(":")
+        client_id, client_secret = unquote(raw_id), unquote(raw_secret)
+    app = _resolve_app(db, client_id)
+    if app is None or not client_secret or not hmac.compare_digest(app.client_secret, str(client_secret)):
+        return None
+    return app
+
+
+def _hidden_fields(client_id: str, redirect_uri: str, scope: str, state: str) -> str:
+    """The OAuth parameters carried through the authorize form, HTML-escaped."""
+    fields = {"client_id": client_id, "redirect_uri": redirect_uri, "scope": scope, "state": state}
+    return "\n  ".join(f'<input type="hidden" name="{name}" value="{escape(value)}">' for name, value in fields.items())
+
+
+def _login_form(
+    client_id: str, redirect_uri: str, scope: str, state: str, *, error: str = "", status: int = 200
+) -> Response:
+    """Password mode's sign-in page."""
+    message = f'<p role="alert">{escape(error)}</p>' if error else ""
+    html = f"""<!doctype html>
+<html><head><title>mastodon_mock: sign in</title></head>
+<body>
+<h1>mastodon_mock</h1>
+<p>Sign in to authorize this app.</p>
+{message}
+<form method="post" action="/oauth/authorize">
+  {_hidden_fields(client_id, redirect_uri, scope, state)}
+  <label>Username or email <input name="username" autocomplete="username" required></label>
+  <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+  <button type="submit">Authorize</button>
+</form>
+</body></html>"""
+    return HTMLResponse(content=html, status_code=status)
+
+
+def _code_redirect(redirect_uri: str, code: str, state: str) -> Response:
+    """Send the code back to the client, or show it for the ``oob`` redirect."""
+    if redirect_uri == _OOB_REDIRECT:
+        return HTMLResponse(f"<!doctype html><html><body><p>Authorization code: {escape(code)}</p></body></html>")
+    params = {"code": code, **({"state": state} if state else {})}
     separator = "&" if "?" in redirect_uri else "?"
-    target = f"{redirect_uri}{separator}code={code}"
-    if state:
-        target += f"&state={state}"
-    return RedirectResponse(url=target, status_code=302)
+    return RedirectResponse(url=f"{redirect_uri}{separator}{urlencode(params)}", status_code=302)
 
 
 @router.post("/oauth/revoke")
@@ -270,8 +444,14 @@ def app_verify_credentials(db: DbSession, token: CurrentToken) -> dict[str, Any]
 
 
 @router.post("/api/v1/accounts", status_code=200)
-async def create_account(request: Request, db: DbSession, token: CurrentToken) -> dict[str, Any]:
-    """Self-service signup: create an account + user token."""
+async def create_account(request: Request, db: DbSession, token: CurrentToken, config: Config) -> dict[str, Any]:
+    """Self-service signup: create an account + user token.
+
+    Honours ``registration_approval_required`` (the account starts pending) and, in
+    password mode, ``registrations_enabled``.
+    """
+    if config.auth.require_password and not config.registrations_enabled:
+        raise HTTPException(status_code=403, detail="Registrations are not open on this server")
     form = await request.form()
     username = form.get("username")
     email = form.get("email")
@@ -294,7 +474,17 @@ async def create_account(request: Request, db: DbSession, token: CurrentToken) -
             status_code=422, detail={"error": "Validation failed", "details": {"username": [{"error": "ERR_TAKEN"}]}}
         )
 
-    account = Account(username=username, display_name=username, created_at=utcnow(), fields=[])
+    account = Account(
+        username=username,
+        display_name=username,
+        created_at=utcnow(),
+        fields=[],
+        email=str(email),
+        ip=request.client.host if request.client else None,
+        approved=not config.registration_approval_required,
+        invite_request=str(form.get("reason") or "") or None,
+        password_hash=hash_password(str(password)),
+    )
     db.add(account)
     db.flush()
     new_token = OAuthToken(

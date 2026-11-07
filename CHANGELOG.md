@@ -5,8 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `[auth] require_password` password mode for running the mock on a public host: password sign-in with single-use codes, client secret checks, staff-only admin API, and no `/api/v1/_mock/*` or `/_ui/`.
+- `mastodon_mock set-password` CLI command to create accounts and set passwords.
+
 ### Changed
 - Requires Python 3.11 or newer; Python 3.10 is no longer supported.
+- Signup stores the email, IP, reason and password hash, and honours `registration_approval_required`.
+
+### Fixed
+- `grant_type=refresh_token` without a `refresh_token` no longer re-keys and returns an arbitrary existing token.
+- The authorize page escapes its query parameters and account names.
 
 ## [0.6.1] - 2026-09-11
 ### Fixed

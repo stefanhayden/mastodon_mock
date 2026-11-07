@@ -13,15 +13,19 @@ from mastodon_mock.services import attach_mentions_and_tags, do_follow
 _DEFAULT_SCOPES = ["read", "write", "follow", "push"]
 
 
-def apply_seed_data(engine: Engine, seed: SeedConfig) -> None:
-    """Apply seed accounts, follows, and statuses idempotently."""
+def apply_seed_data(engine: Engine, seed: SeedConfig, *, with_tokens: bool = True) -> None:
+    """Apply seed accounts, follows, and statuses idempotently.
+
+    ``with_tokens=False`` skips seed access tokens, which are well-known strings
+    (e.g. ``mock_token``) that must not work on a password-protected server.
+    """
     with Session(engine) as session:
         username_to_account: dict[str, Account] = {}
 
         for spec in seed.accounts:
             account = _ensure_account(session, spec)
             username_to_account[spec.username] = account
-            if spec.access_token:
+            if spec.access_token and with_tokens:
                 _ensure_token(session, spec.access_token, account.id)
 
         session.flush()

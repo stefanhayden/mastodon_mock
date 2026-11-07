@@ -40,6 +40,11 @@ class AuthConfig(BaseModel):
     # If true, enforce coarse OAuth scopes (read/write/follow) on the token.
     # Off by default — the mock stores+echoes scopes but does not check them.
     enforce_scopes: bool = False
+    # Lock the mock down for a publicly reachable host (see spec/04-auth.md "Password
+    # mode"): /oauth/authorize asks for a password and mints single-use random codes,
+    # /api/v1/_mock/* and /_ui/ are removed, admin endpoints require a staff role, seed
+    # access tokens are not created, and signups honour registrations_enabled.
+    require_password: bool = False
 
 
 class RateLimitConfig(BaseModel):
